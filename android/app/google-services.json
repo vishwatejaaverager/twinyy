@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "904755733459",
+    "project_id": "twinyaiclone",
+    "storage_bucket": "twinyaiclone.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:904755733459:android:5c0d019118614917fa0526",
+        "android_client_info": {
+          "package_name": "com.privateai.privateai_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA4LG8HfyBIiyA4h-PcVXutr9F2Kchonsc"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

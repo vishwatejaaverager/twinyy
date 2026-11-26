@@ -1,39 +1,29 @@
 package com.privateai.privateai_app
 
-import android.app.Notification
 import android.app.RemoteInput
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
-import kotlinx.coroutines.*
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.BufferedReader
 import java.io.File
-import java.io.InputStreamReader
-import java.io.OutputStreamWriter
-import java.net.HttpURLConnection
-import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
 
 class MyNotificationListenerService : NotificationListenerService() {
 
     private val TAG = "MyNotificationListener"
-    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    
-    // Update this IP to your local server's IP
-    private val API_URL = "https://862a-2401-4900-1c0e-108f-4c5a-4d3b-de6c-2499.ngrok-free.app/api/notification/reply"
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     companion object {
         private var instance: MyNotificationListenerService? = null
         private val notificationMap = ConcurrentHashMap<String, StatusBarNotification>()
-        // Set to track which notifications we've already replied to in this session
-        private val repliedNotificationKeys = java.util.Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
 
         fun sendReply(notificationKey: String, message: String): Boolean {
-            val sbn = notificationMap.get(notificationKey) ?: return false
+            val sbn = notificationMap[notificationKey] ?: return false
             return instance?.replyToNotification(sbn, message) ?: false
         }
     }
@@ -45,7 +35,6 @@ class MyNotificationListenerService : NotificationListenerService() {
 
     override fun onDestroy() {
         super.onDestroy()
-        serviceScope.cancel()
         if (instance == this) instance = null
     }
 
@@ -63,14 +52,14 @@ class MyNotificationListenerService : NotificationListenerService() {
         val ts = sbn.postTime
         val key = sbn.key ?: return
 
-        notificationMap.put(key, sbn)
+        notificationMap[key] = sbn
 
         Log.d(TAG, "Incoming Notification ($pkg): $title - $text (Key: $key)")
 
-        // 1. Store notification
+        // 1. Store notification locally
         saveNotification(key, pkg, title, text, ts)
 
-        // 2. Notify Flutter via Method Channel
+        // 2. Notify Flutter on the main thread (handled by Firebase AI + Cloud Firestore)
         val notificationData = mapOf(
             "key" to key,
             "package" to pkg,
@@ -78,46 +67,8 @@ class MyNotificationListenerService : NotificationListenerService() {
             "text" to text,
             "timestamp" to ts
         )
-        MainActivity.notifyFlutter("onNotificationReceived", notificationData)
-
-        // 3. Direct API fallback for immediate reply
-        serviceScope.launch {
-            try {
-                val reply = fetchAiReply(title, text)
-                if (reply != null && reply.isNotEmpty()) {
-                    Log.d(TAG, "AI thinking... sending reply: $reply")
-                    replyToNotification(sbn, reply)
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Direct API call failed", e)
-            }
-        }
-    }
-
-    private suspend fun fetchAiReply(chatName: String, message: String): String? = withContext(Dispatchers.IO) {
-        try {
-            val url = URL(API_URL)
-            val conn = url.openConnection() as HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.setRequestProperty("Content-Type", "application/json")
-            conn.doOutput = true
-
-            val jsonBody = JSONObject().apply {
-                put("chat_name", chatName)
-                put("message", message)
-            }
-
-            OutputStreamWriter(conn.outputStream).use { it.write(jsonBody.toString()) }
-
-            if (conn.responseCode == 200) {
-                val response = conn.inputStream.bufferedReader().use { it.readText() }
-                val jsonObj = JSONObject(response)
-                jsonObj.optString("reply")
-            } else {
-                null
-            }
-        } catch (e: Exception) {
-            null
+        mainHandler.post {
+            MainActivity.notifyFlutter("onNotificationReceived", notificationData)
         }
     }
 
@@ -131,17 +82,17 @@ class MyNotificationListenerService : NotificationListenerService() {
 
     fun replyToNotification(sbn: StatusBarNotification, message: String): Boolean {
         val actions = sbn.notification.actions ?: return false
-        
+
         for (action in actions) {
             val remoteInputs = action.remoteInputs ?: continue
             for (remoteInput in remoteInputs) {
                 try {
                     val resultBundle = Bundle()
                     resultBundle.putCharSequence(remoteInput.resultKey, message)
-                    
+
                     val intent = Intent()
                     RemoteInput.addResultsToIntent(arrayOf(remoteInput), intent, resultBundle)
-                    
+
                     action.actionIntent.send(applicationContext, 0, intent)
                     Log.d(TAG, "Reply sent successfully for ${sbn.key}")
                     return true
@@ -170,7 +121,7 @@ class MyNotificationListenerService : NotificationListenerService() {
             }
 
             val notifications = root.getJSONArray("notifications")
-            
+
             for (i in 0 until notifications.length()) {
                 val item = notifications.getJSONObject(i)
                 if (item.optString("key") == key) {

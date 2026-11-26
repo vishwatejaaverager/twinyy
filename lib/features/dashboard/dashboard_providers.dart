@@ -1,43 +1,48 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import '../../services/remote/api_service.dart';
+import '../../services/firebase_ai_service.dart';
+import '../../services/firebase_chat_service.dart';
 import '../onboarding/onboarding_providers.dart';
 
-final dashboardPlatformProvider = Provider((ref) => const MethodChannel('twiny/messages'));
-final apiServiceProvider = Provider((ref) => ApiService());
+final dashboardPlatformProvider =
+    Provider((ref) => const MethodChannel('twiny/messages'));
+final firebaseAiServiceProvider = Provider((ref) => FirebaseAiService());
+final firebaseChatServiceProvider = Provider((ref) => FirebaseChatService());
 
 final researchModeProvider = StateProvider<bool>((ref) => false);
 final accessibilityEnabledProvider = StateProvider<bool>((ref) => false);
 final notificationAccessEnabledProvider = StateProvider<bool>((ref) => false);
-final isExportingProvider = StateProvider<bool>((ref) => false);
+final isSyncingCloudProvider = StateProvider<bool>((ref) => false);
 final currentViewProvider = StateProvider<String>((ref) => 'whatsapp');
 
 final notificationsProvider = StateProvider<List<dynamic>>((ref) => []);
 final appMessagesProvider = StateProvider<Map<String, List<dynamic>>>((ref) => {
-  'whatsapp': [],
-  'teams': []
-});
+      'whatsapp': [],
+      'teams': [],
+    });
 final appCountsProvider = StateProvider<Map<String, int>>((ref) => {
-  'whatsapp': 0,
-  'teams': 0
-});
+      'whatsapp': 0,
+      'teams': 0,
+    });
 
-final autoReplySettingsProvider = StateNotifierProvider<AutoReplySettingsNotifier, Map<String, bool>>((ref) {
+final autoReplySettingsProvider =
+    StateNotifierProvider<AutoReplySettingsNotifier, Map<String, bool>>((ref) {
   final prefs = ref.watch(sharedPreferencesProvider);
-  return AutoReplySettingsNotifier(prefs);
+  final chatService = ref.watch(firebaseChatServiceProvider);
+  return AutoReplySettingsNotifier(prefs, chatService);
 });
 
 class AutoReplySettingsNotifier extends StateNotifier<Map<String, bool>> {
   final SharedPreferences _prefs;
+  final FirebaseChatService _chatService;
   static const String _key = 'auto_reply_settings';
 
-  AutoReplySettingsNotifier(this._prefs) : super({}) {
+  AutoReplySettingsNotifier(this._prefs, this._chatService) : super({}) {
     _load();
+    _syncFromCloud();
   }
 
   void _load() {
@@ -50,13 +55,23 @@ class AutoReplySettingsNotifier extends StateNotifier<Map<String, bool>> {
     }
   }
 
+  Future<void> _syncFromCloud() async {
+    final cloudSettings = await _chatService.getAllAutoReplySettings();
+    if (cloudSettings.isNotEmpty) {
+      final merged = {...cloudSettings, ...state};
+      state = merged;
+      await _prefs.setString(_key, jsonEncode(merged));
+    }
+  }
+
   Future<void> toggle(String chatName, bool value) async {
     final newState = {...state, chatName: value};
     state = newState;
     await _prefs.setString(_key, jsonEncode(newState));
+    await _chatService.setAutoReplyEnabled(chatName, value);
   }
 
-  bool isEnabled(String chatName) => state[chatName] ?? false; // Default to false
+  bool isEnabled(String chatName) => state[chatName] ?? false;
 }
 
 class DashboardNotifier extends StateNotifier<void> {
@@ -64,7 +79,9 @@ class DashboardNotifier extends StateNotifier<void> {
   final MethodChannel _platform;
   Timer? _timer;
 
-  DashboardNotifier(this.ref) : _platform = ref.read(dashboardPlatformProvider), super(null);
+  DashboardNotifier(this.ref)
+      : _platform = ref.read(dashboardPlatformProvider),
+        super(null);
 
   void startPolling() {
     _timer?.cancel();
@@ -83,13 +100,14 @@ class DashboardNotifier extends StateNotifier<void> {
       fetchResearchMode(),
       fetchCounts(),
       fetchNotifications(),
-      fetchCurrentTab(),
+      fetchAllAppMessages(),
     ]);
   }
 
   Future<void> checkNotificationPermission() async {
     try {
-      final bool enabled = await _platform.invokeMethod('isNotificationListenerEnabled');
+      final bool enabled =
+          await _platform.invokeMethod('isNotificationListenerEnabled');
       ref.read(notificationAccessEnabledProvider.notifier).state = enabled;
     } catch (_) {}
   }
@@ -98,7 +116,8 @@ class DashboardNotifier extends StateNotifier<void> {
     try {
       final String? json = await _platform.invokeMethod('getNotifications');
       if (json != null) {
-        final Map<String, dynamic> data = Map<String, dynamic>.from(const JsonDecoder().convert(json));
+        final Map<String, dynamic> data =
+            Map<String, dynamic>.from(const JsonDecoder().convert(json));
         final List<dynamic> list = data['notifications'] ?? [];
         ref.read(notificationsProvider.notifier).state = list.reversed.toList();
       }
@@ -107,7 +126,8 @@ class DashboardNotifier extends StateNotifier<void> {
 
   Future<void> fetchResearchMode() async {
     try {
-      final bool enabled = await _platform.invokeMethod('isResearchModeEnabled');
+      final bool enabled =
+          await _platform.invokeMethod('isResearchModeEnabled');
       ref.read(researchModeProvider.notifier).state = enabled;
     } catch (_) {}
   }
@@ -126,8 +146,14 @@ class DashboardNotifier extends StateNotifier<void> {
     } catch (_) {}
   }
 
-  Future<void> fetchCurrentTab() async {
-    final app = ref.read(currentViewProvider);
+  Future<void> fetchAllAppMessages() async {
+    await Future.wait([
+      _fetchMessagesForApp('whatsapp'),
+      _fetchMessagesForApp('teams'),
+    ]);
+  }
+
+  Future<void> _fetchMessagesForApp(String app) async {
     try {
       final String? json = await _platform.invokeMethod(
         'getMessagesForApp',
@@ -145,127 +171,140 @@ class DashboardNotifier extends StateNotifier<void> {
 
   Future<void> checkAccessibilityPermission() async {
     try {
-      final bool enabled = await _platform.invokeMethod('isAccessibilityEnabled');
+      final bool enabled =
+          await _platform.invokeMethod('isAccessibilityEnabled');
       ref.read(accessibilityEnabledProvider.notifier).state = enabled;
       if (!enabled && ref.read(researchModeProvider)) {
-         ref.read(researchModeProvider.notifier).state = false;
+        ref.read(researchModeProvider.notifier).state = false;
       }
     } catch (_) {}
   }
 
   Future<void> toggleResearchMode(bool value) async {
-     try {
-      await _platform.invokeMethod(value ? 'enableResearchMode' : 'disableResearchMode');
+    try {
+      await _platform
+          .invokeMethod(value ? 'enableResearchMode' : 'disableResearchMode');
       ref.read(researchModeProvider.notifier).state = value;
     } catch (_) {}
   }
 
   Future<void> clearMessagesForChat(String app, String chatName) async {
     try {
-      final bool success = await _platform.invokeMethod('clearMessagesForChat', {
+      final bool success =
+          await _platform.invokeMethod('clearMessagesForChat', {
         'app': app,
         'chatName': chatName,
       });
       if (success) {
-        await fetchCurrentTab();
+        await _fetchMessagesForApp(app);
       }
     } catch (_) {}
   }
 
-  // ── API Actions ────────────────────────────────────────────────────────────
+  // ── Firebase Cloud Firestore & Firebase AI Actions ─────────────────────────
 
-  Future<bool> uploadFile(File file, String filename) async {
-    try {
-      final apiService = ref.read(apiServiceProvider);
-      final response = await apiService.uploadFile(file, filename);
-      return response.statusCode == 200 || response.statusCode == 201;
-    } catch (_) {
-      return false;
-    }
+  Future<bool> uploadIndividualChat(
+    String app,
+    String chatName,
+    List<dynamic> messages,
+  ) async {
+    final chatService = ref.read(firebaseChatServiceProvider);
+    return chatService.uploadChatMessages(app, chatName, messages);
   }
 
-  Future<bool> uploadIndividualChat(String app, String chatName, List<dynamic> messages) async {
-    File? tempFile;
+  Future<bool> syncAllChatsToCloud() async {
+    if (ref.read(isSyncingCloudProvider)) return false;
+    ref.read(isSyncingCloudProvider.notifier).state = true;
     try {
-      final apiService = ref.read(apiServiceProvider);
-      final tempDir = await getTemporaryDirectory();
-      tempFile = File('${tempDir.path}/temp_${chatName}_${DateTime.now().millisecondsSinceEpoch}.json');
-      
-      final data = {
-        'app': app,
-        'chat_name': chatName,
-        'messages': messages,
-        'timestamp': DateTime.now().millisecondsSinceEpoch,
-      };
-      
-      await tempFile.writeAsString(jsonEncode(data));
-      
-      final response = await apiService.uploadFile(
-        tempFile,
-        'individual_${chatName}_${DateTime.now().millisecondsSinceEpoch}.json',
+      final chatService = ref.read(firebaseChatServiceProvider);
+      final appMessages = ref.read(appMessagesProvider);
+      final waOk = await chatService.syncAppMessages(
+        'whatsapp',
+        appMessages['whatsapp'] ?? [],
       );
-      
-      return response.statusCode == 200 || response.statusCode == 201;
-    } catch (_) {
-      return false;
+      final teamsOk = await chatService.syncAppMessages(
+        'teams',
+        appMessages['teams'] ?? [],
+      );
+      return waOk && teamsOk;
     } finally {
-      try { await tempFile?.delete(); } catch (_) {}
+      ref.read(isSyncingCloudProvider.notifier).state = false;
     }
   }
 
   Future<bool> deletePerson(String personName) async {
-    try {
-      final apiService = ref.read(apiServiceProvider);
-      final response = await apiService.deletePerson(personName);
-      return response.statusCode == 200 || response.statusCode == 204;
-    } catch (_) {
-      return false;
-    }
+    final chatService = ref.read(firebaseChatServiceProvider);
+    return chatService.deletePerson(personName);
   }
 
-  Future<void> updateMessage(String chatName, String sender, String text) async {
-    try {
-      final apiService = ref.read(apiServiceProvider);
-      await apiService.updateMessage(chatName, sender, text);
-    } catch (_) {}
+  Future<void> updateMessage(
+    String chatName,
+    String sender,
+    String text, {
+    String app = 'unknown',
+  }) async {
+    final chatService = ref.read(firebaseChatServiceProvider);
+    await chatService.addMessage(
+      chatName: chatName,
+      sender: sender,
+      text: text,
+      app: app,
+    );
   }
 
-  Future<bool> brainSync(String chatName, String contextData) async {
-    try {
-      final apiService = ref.read(apiServiceProvider);
-      final response = await apiService.brainSync(chatName, contextData);
-      return response.statusCode == 200 || response.statusCode == 204;
-    } catch (_) {
-      return false;
-    }
+  Future<bool> brainSync(String chatName, String rulebook) async {
+    final chatService = ref.read(firebaseChatServiceProvider);
+    return chatService.saveBrainState(chatName, rulebook);
   }
 
   Future<List<String>?> getBrainSyncQuestions(String contextData) async {
-    try {
-      final apiService = ref.read(apiServiceProvider);
-      final response = await apiService.getBrainSyncQuestions(contextData);
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        return List<String>.from(data['questions'] ?? []);
-      }
-      return null;
-    } catch (_) {
-      return null;
-    }
+    final aiService = ref.read(firebaseAiServiceProvider);
+    return aiService.generateDiscoveryQuestions(contextData);
   }
 
-  Future<String?> finalizeBrainSync(String originalIntent, String userAnswers) async {
-    try {
-      final apiService = ref.read(apiServiceProvider);
-      final response = await apiService.finalizeBrainSync(originalIntent, userAnswers);
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        return data['brain_state'] as String?;
-      }
-      return null;
-    } catch (_) {
-      return null;
+  Future<String?> finalizeBrainSync(
+    String originalIntent,
+    String userAnswers,
+  ) async {
+    final aiService = ref.read(firebaseAiServiceProvider);
+    return aiService.generateRulebook(
+      originalIntent: originalIntent,
+      userAnswers: userAnswers,
+    );
+  }
+
+  Future<String?> generateSimulatedReply(
+    String chatName,
+    String incomingMessage,
+  ) async {
+    final aiService = ref.read(firebaseAiServiceProvider);
+    final chatService = ref.read(firebaseChatServiceProvider);
+
+    final brainState = await chatService.getBrainState(chatName);
+    List<Map<String, dynamic>> history =
+        await chatService.getRecentMessages(chatName, limit: 20);
+
+    if (history.isEmpty) {
+      final appMsgsMap = ref.read(appMessagesProvider);
+      final allLocal = [
+        ...appMsgsMap['whatsapp'] ?? [],
+        ...appMsgsMap['teams'] ?? [],
+      ];
+      history = allLocal
+          .whereType<Map>()
+          .where((m) =>
+              (m['chat_name'] as String? ?? '').toLowerCase() ==
+              chatName.toLowerCase())
+          .map((m) => Map<String, dynamic>.from(m))
+          .toList();
     }
+
+    return aiService.generateReply(
+      chatName: chatName,
+      incomingMessage: incomingMessage,
+      history: history,
+      brainState: brainState,
+    );
   }
 }
 
